@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import sys
@@ -21,6 +22,8 @@ from strategy.adaptive_selector import AdaptiveSelector
 from utils.codec_registry import build_codecs
 from utils.image_io import iter_image_paths
 from utils.logging_utils import setup_logging
+from utils.output_artifacts import copy_best_bitstream
+from utils.output_options import resolve_output_options
 from utils.report import (
     generate_dataset_summary,
     plot_cr_hist,
@@ -72,6 +75,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-trials-per-codec", type=int, default=None)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--save-candidates",
+        type=parse_bool,
+        default=True,
+        help="Whether to keep per-parameter candidate bitstreams/reconstructions/result.json files.",
+    )
+    parser.add_argument(
+        "--save-all-results-csv",
+        type=parse_bool,
+        default=True,
+        help="Whether to keep per-image all_results.csv files and dataset all_candidate_results.csv.",
+    )
+    parser.add_argument(
+        "--best-bitstreams-dir",
+        type=Path,
+        default=None,
+        help="Optional flat directory for selected best compressed bitstreams.",
+    )
+    parser.add_argument(
+        "--best-only",
+        action="store_true",
+        help=(
+            "Only write selected best compressed bitstreams. "
+            "If --best-bitstreams-dir is omitted, --output-dir is used as the flat bitstream directory."
+        ),
+    )
 
     parser.add_argument(
         "--workers",
@@ -144,6 +173,9 @@ def _compress_one_image(
     mode: str,
     max_trials_per_codec: int | None,
     search_mode: str,
+    save_candidate_artifacts: bool,
+    save_all_results_csv: bool,
+    keep_candidate_results: bool,
 ) -> tuple[CodecResult, list[CodecResult]]:
     image_work_dir = output_dir / "images" / _safe_image_id(input_dir, image_path)
 
@@ -154,10 +186,14 @@ def _compress_one_image(
         mode=mode,
         max_trials_per_codec=max_trials_per_codec,
         search_mode=search_mode,
+        save_candidate_artifacts=save_candidate_artifacts,
+        save_all_results_csv=save_all_results_csv,
     )
 
     try:
         best, candidates, _features = selector.compress(image_path, image_work_dir)
+        if not keep_candidate_results:
+            candidates = []
     except Exception as exc:
         LOGGER.exception("Failed to evaluate %s", image_path)
         best = _failure_result(image_path, image_work_dir, str(exc))
@@ -196,6 +232,9 @@ def _worker_task(
         str,
         int | None,
         str,
+        bool,
+        bool,
+        bool,
     ],
 ) -> tuple[CodecResult, list[CodecResult]]:
     global _WORKER_CODECS
@@ -212,6 +251,9 @@ def _worker_task(
         mode,
         max_trials_per_codec,
         search_mode,
+        save_candidate_artifacts,
+        save_all_results_csv,
+        keep_candidate_results,
     ) = payload
 
     return _compress_one_image(
@@ -224,7 +266,26 @@ def _worker_task(
         mode=mode,
         max_trials_per_codec=max_trials_per_codec,
         search_mode=search_mode,
+        save_candidate_artifacts=save_candidate_artifacts,
+        save_all_results_csv=save_all_results_csv,
+        keep_candidate_results=keep_candidate_results,
     )
+
+
+def _copy_best_bitstream_if_requested(
+    best: CodecResult,
+    *,
+    best_bitstreams_dir: Path | None,
+    input_dir: Path,
+    image_path: Path,
+) -> None:
+    if best_bitstreams_dir is None or not best.success:
+        return
+
+    try:
+        copy_best_bitstream(best, best_bitstreams_dir, _safe_image_id(input_dir, image_path))
+    except Exception as exc:
+        LOGGER.warning("Failed to copy best bitstream for %s: %s", image_path, exc)
 
 
 def main() -> int:
@@ -246,8 +307,19 @@ def main() -> int:
         return 2
 
     workers = _resolve_workers(args.workers, len(image_paths))
+    output_options = resolve_output_options(
+        output_dir=args.output_dir,
+        best_bitstreams_dir=args.best_bitstreams_dir,
+        best_only=args.best_only,
+        save_candidates=args.save_candidates,
+        save_all_results_csv=args.save_all_results_csv,
+    )
+    if output_options.best_bitstreams_dir is not None:
+        output_options.best_bitstreams_dir.mkdir(parents=True, exist_ok=True)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    temp_work_dir = tempfile.TemporaryDirectory(prefix="image-compression-eval-") if args.best_only else None
+    work_output_dir = Path(temp_work_dir.name) if temp_work_dir is not None else args.output_dir
+    work_output_dir.mkdir(parents=True, exist_ok=True)
 
     per_image_best_slots: list[CodecResult | None] = [None] * len(image_paths)
     candidate_slots: list[list[CodecResult]] = [[] for _ in image_paths]
@@ -265,17 +337,27 @@ def main() -> int:
             best, candidates = _compress_one_image(
                 image_path=image_path,
                 input_dir=args.input_dir,
-                output_dir=args.output_dir,
+                output_dir=work_output_dir,
                 codecs=codecs,
                 target_ratio=args.target_ratio,
                 min_psnr=args.min_psnr,
                 mode=args.mode,
                 max_trials_per_codec=args.max_trials_per_codec,
                 search_mode=args.search,
+                save_candidate_artifacts=output_options.save_candidate_artifacts,
+                save_all_results_csv=output_options.save_all_results_csv,
+                keep_candidate_results=output_options.save_all_results_csv,
             )
 
             per_image_best_slots[idx] = best
-            candidate_slots[idx] = candidates
+            if output_options.save_all_results_csv:
+                candidate_slots[idx] = candidates
+            _copy_best_bitstream_if_requested(
+                best,
+                best_bitstreams_dir=output_options.best_bitstreams_dir,
+                input_dir=args.input_dir,
+                image_path=image_path,
+            )
 
     else:
         # 主进程先构造一次，用于提前检查 codec 名称 / 环境。
@@ -290,12 +372,15 @@ def main() -> int:
             (
                 image_path,
                 args.input_dir,
-                args.output_dir,
+                work_output_dir,
                 args.target_ratio,
                 args.min_psnr,
                 args.mode,
                 args.max_trials_per_codec,
                 args.search,
+                output_options.save_candidate_artifacts,
+                output_options.save_all_results_csv,
+                output_options.save_all_results_csv,
             )
             for image_path in image_paths
         ]
@@ -322,7 +407,7 @@ def main() -> int:
                     best, candidates = future.result()
                 except Exception as exc:
                     LOGGER.exception("Worker crashed while evaluating %s", image_path)
-                    image_work_dir = args.output_dir / "images" / _safe_image_id(args.input_dir, image_path)
+                    image_work_dir = work_output_dir / "images" / _safe_image_id(args.input_dir, image_path)
                     best = _failure_result(
                         image_path,
                         image_work_dir,
@@ -331,33 +416,50 @@ def main() -> int:
                     candidates = []
 
                 per_image_best_slots[idx] = best
-                candidate_slots[idx] = candidates
+                if output_options.save_all_results_csv:
+                    candidate_slots[idx] = candidates
+                _copy_best_bitstream_if_requested(
+                    best,
+                    best_bitstreams_dir=output_options.best_bitstreams_dir,
+                    input_dir=args.input_dir,
+                    image_path=image_path,
+                )
 
     per_image_best = [result for result in per_image_best_slots if result is not None]
-    all_candidates = [
-        candidate
-        for candidates in candidate_slots
-        for candidate in candidates
-    ]
-
-    save_all_results_csv(per_image_best, args.output_dir / "per_image_results.csv")
-    save_all_results_csv(all_candidates, args.output_dir / "all_candidate_results.csv")
-
-    generate_dataset_summary(
-        per_image_best,
-        all_candidates,
-        args.output_dir,
-        dataset_path=args.input_dir,
-        target_ratio=args.target_ratio,
-        min_psnr=args.min_psnr,
-        mode=args.mode,
+    all_candidates = (
+        [
+            candidate
+            for candidates in candidate_slots
+            for candidate in candidates
+        ]
+        if output_options.save_all_results_csv
+        else []
     )
 
-    plot_rd_scatter(all_candidates, args.output_dir / "rd_scatter.png")
-    plot_psnr_hist(per_image_best, args.output_dir / "psnr_hist.png")
-    plot_cr_hist(per_image_best, args.output_dir / "cr_hist.png")
+    if not args.best_only:
+        save_all_results_csv(per_image_best, work_output_dir / "per_image_results.csv")
+        if output_options.save_all_results_csv:
+            save_all_results_csv(all_candidates, work_output_dir / "all_candidate_results.csv")
 
-    LOGGER.info("Evaluation complete. Reports written to %s", args.output_dir)
+        generate_dataset_summary(
+            per_image_best,
+            all_candidates,
+            work_output_dir,
+            dataset_path=args.input_dir,
+            target_ratio=args.target_ratio,
+            min_psnr=args.min_psnr,
+            mode=args.mode,
+        )
+
+        if output_options.save_all_results_csv:
+            plot_rd_scatter(all_candidates, work_output_dir / "rd_scatter.png")
+        plot_psnr_hist(per_image_best, work_output_dir / "psnr_hist.png")
+        plot_cr_hist(per_image_best, work_output_dir / "cr_hist.png")
+
+    final_output = output_options.best_bitstreams_dir if args.best_only else work_output_dir
+    LOGGER.info("Evaluation complete. Outputs written to %s", final_output)
+    if temp_work_dir is not None:
+        temp_work_dir.cleanup()
     return 0
 
 

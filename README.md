@@ -83,20 +83,43 @@
 
 ```bash
 sudo apt update
+
 sudo apt install -y \
-  git wget curl unzip tree build-essential \
-  python3 python3-venv python3-pip \
-  libjpeg-dev zlib1g-dev libtiff-dev libpng-dev
+  git \
+  wget \
+  curl \
+  unzip \
+  tree \
+  build-essential \
+  python3 \
+  python3-venv \
+  python3-pip \
+  libjpeg-dev \
+  zlib1g-dev \
+  libtiff-dev \
+  libpng-dev
 
 ```
 
 #### 2. 安装外部传统编解码器二进制命令行工具
 
 ```bash
-sudo apt install -y libjxl-tools libavif-bin openjpeg-tools
+sudo apt install -y \
+  libjxl-tools \
+  libavif-bin \
+  libopenjp2-tools
 
 ```
-
+检查工具是否可用：
+```bash
+which cjxl
+which djxl
+which avifenc
+which avifdec
+which opj_compress
+which opj_decompress
+```
+如果都能输出路径，说明编码器工具安装成功。
 *(注：BPG 编码器由于版权等原因不在 Ubuntu 的默认官方 apt 源中，属于可选支持，不安装时系统在启动健康检查后会自动将其跳过，不阻断程序运行)*。
 
 #### 3. Python 虚拟环境与依赖包装配
@@ -145,6 +168,10 @@ python compress.py \
 | **`--max-trials-per-codec`** | `int` | 否 | 限制单个编码器在穷举时最多只允许评测参数池中的前 N 种可能。 | 默认不填（`None`），代表全参数空间大扫荡。如果在大分辨率遥感测试下耗时严重，可以填入 `3` 或 `5` 截断测试。 | 任意正整数，或者不填。 |
 | **`--timeout`** | `float` | 否 | 发起外部命令行进程调用时的超时强制熔断阈值（秒）。 | 默认值 `600.0`（10分钟）。若要批量压制分辨率极其庞大（例如单图数千万像素）的遥感超大原始图切片，建议将此值放大。 | 任意正浮点数。 |
 | **`--log-level`** | `str` | 否 | 控制台打印出的实时日志信息颗粒度分级。 | 默认值 `INFO`。若遇到外部工具死锁崩溃，可以填入 `DEBUG` 查看具体底层的进程报错详情。 | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`。 |
+| **`--save-candidates`** | `bool` | 否 | 是否保留每个候选参数组合的中间码流、重建图和 `result.json`。 | 默认 `true` 保持完整可追溯；大批量测试、只关心最优结果时建议填 `false` 节省磁盘和目录开销。 | `true/false`, `1/0`, `yes/no`, `y/n`。 |
+| **`--save-all-results-csv`** | `bool` | 否 | 是否输出候选全集 CSV。单图对应 `all_results.csv`。 | 默认 `true`；如果不需要候选明细表，填 `false`。 | `true/false`, `1/0`, `yes/no`, `y/n`。 |
+| **`--best-bitstreams-dir`** | `Path` | 否 | 将最终 best 压缩码流额外复制到一个扁平目录。 | 单图会输出为 `compressed.<ext>`，例如 `compressed.avif`。 | 任意合法文件夹路径。 |
+| **`--best-only`** | flag | 否 | 只输出最终 best 压缩码流。 | 开启后自动关闭 candidates 和 all-results CSV，并使用临时工作目录；若不填 `--best-bitstreams-dir`，则把 `--output-dir` 当作扁平码流目录。 | 开关参数，无需取值。 |
 
 ---
 
@@ -179,13 +206,62 @@ python eval.py \
   --codecs jxl,avif,jpeg2000 \
   --workers 0
 ``` 
-`eval.py` 完全承袭了 `compress.py` 的全套算法深度控制参数（如 `--mode`, `--target-ratio`, `--min-psnr` 等），其核心作用完全对齐。以下仅单独为你展现其**特有或发生形态改变**的三个特殊参数：
+`eval.py` 完全承袭了 `compress.py` 的全套算法深度控制参数（如 `--mode`, `--target-ratio`, `--min-psnr`, `--save-candidates`, `--save-all-results-csv`, `--best-bitstreams-dir`, `--best-only` 等），其核心作用完全对齐。以下单独列出其**特有或发生形态改变**的参数：
 
 | 命令行参数 | 参数类型 | 是否必填 | 核心含义与作用 | 填法指导与推荐值 | 所有合法候选项 |
 | --- | --- | --- | --- | --- | --- |
 | **`--input-dir`** | `Path` | **是** | 存放测试大样本图像的数据集根目录。 | 填入本地存放图像数据文件夹的物理路径。 | 任意合法的本地已存在文件夹路径（如 `data/kodak`）。 |
 | **`--output-dir`** | `Path` | **是** | 批量跑分结束后，全局学术报告和图表沉淀的落脚目录。 | 填入目标总结果文件夹路径，系统会自动在其下方派生 `summary.md` 等多维度汇总成果。 | 任意合法的本地空目录路径（如 `reports/remote_eval`）。 |
 | **`--recursive`** | `bool` | 否 | 是否对输入根目录执行深度穿透扫描，挖掘其**子文件夹内部**嵌套的全部图片。 | 默认值 `false`。若图片都在第一层（如 Kodak），填 `false`；如果是包含层级子目录的大规模遥感图片集，**必须填入 `true`**。 | 字符串或布尔对象：<br>• 判定为真的填法：`true`, `1`, `yes`, `y`<br>• 判定为假的填法：`false`, `0`, `no`, `n`。 |
+| **`--workers`** | `int` | 否 | 批量评测的并行 worker 进程数。 | 默认 `0` 表示使用全部 CPU 核心；复现实验、排查问题或显存/内存压力大时建议填 `1`。 | `0` 或任意正整数。 |
+| **`--save-candidates`** | `bool` | 否 | 是否保留每张图片下的 candidates 中间目录。 | 默认 `true`；遥感大样本评测建议填 `false`。 | `true/false`, `1/0`, `yes/no`, `y/n`。 |
+| **`--save-all-results-csv`** | `bool` | 否 | 是否保留每张图的 `all_results.csv` 以及数据集级 `all_candidate_results.csv`。 | 默认 `true`；关闭后 worker 不再把候选全集回传给主进程，可降低大批量测试内存压力。 | `true/false`, `1/0`, `yes/no`, `y/n`。 |
+| **`--best-bitstreams-dir`** | `Path` | 否 | 把每张图最终 best 码流复制到同一个扁平文件夹。 | 批量模式下文件名使用输入相对路径安全化后的 ID，例如 `kodim01.avif`。 | 任意合法文件夹路径。 |
+| **`--best-only`** | flag | 否 | 只输出 best 码流，不输出报告、图表、CSV、候选目录。 | 开启后若不填 `--best-bitstreams-dir`，`--output-dir` 就是最终码流文件夹。 | 开关参数，无需取值。 |
+
+### 推荐输出模式
+
+1. **完整科研复现实验**：保留默认值，输出 candidates、候选全集 CSV、RD 图、PSNR/CR 直方图和 summary 报告。
+
+```bash
+python eval.py \
+  --input-dir data/kodak \
+  --output-dir reports/kodak_eval \
+  --mode quality_first \
+  --target-ratio 16 \
+  --min-psnr 35 \
+  --codecs jxl,avif,jpeg2000 \
+  --workers 1
+```
+
+2. **轻量报告模式**：保留 summary 和每张图 best，关闭候选目录和候选全集 CSV。
+
+```bash
+python eval.py \
+  --input-dir data/kodak \
+  --output-dir reports/kodak_eval_compact \
+  --mode quality_first \
+  --target-ratio 16 \
+  --min-psnr 35 \
+  --codecs jxl,avif,jpeg2000 \
+  --workers 1 \
+  --save-candidates false \
+  --save-all-results-csv false
+```
+
+3. **只交付 best 压缩码流**：所有压缩文件直接落在同一个文件夹，不输出中间过程和报告。
+
+```bash
+python eval.py \
+  --input-dir data/kodak \
+  --output-dir outputs/best_bitstreams \
+  --mode quality_first \
+  --target-ratio 16 \
+  --min-psnr 35 \
+  --codecs avif \
+  --workers 1 \
+  --best-only
+```
 
 ---
 
@@ -223,7 +299,7 @@ python eval.py \
 
 ## 输出文件树产物及作用
 
-无论是进行单图压缩还是批量跑分，输出的最终结果文件夹中均会包含以下结构，各文件的核心工程作用如下：
+默认完整模式下，无论是进行单图压缩还是批量跑分，输出的最终结果文件夹中均会包含以下结构，各文件的核心工程作用如下：
 
 ```text
 outputs/kodim01/
@@ -240,6 +316,112 @@ outputs/kodim01/
   └── features.json            # 图像进入管线前提取的全局一阶感知特征（信息熵、色彩丰富度、边缘密度等）。
 
 ```
+当使用轻量模式：
+
+```bash
+python compress.py \
+  --input data/kodak/kodim01.png \
+  --output-dir outputs/kodim01_compact \
+  --mode quality_first \
+  --target-ratio 16 \
+  --min-psnr 35 \
+  --codecs avif \
+  --save-candidates false \
+  --save-all-results-csv false
+```
+
+输出中会保留 `best/`、`features.json` 和最优结果元数据，但不会保留 `candidates/` 与 `all_results.csv`。
+
+当使用只输出 best 码流模式：
+
+```bash
+python compress.py \
+  --input data/kodak/kodim01.png \
+  --output-dir outputs/best_only \
+  --mode quality_first \
+  --target-ratio 16 \
+  --min-psnr 35 \
+  --codecs avif \
+  --best-only
+```
+
+输出目录将只包含最终压缩码流，例如：
+
+```text
+outputs/best_only/
+  └── compressed.avif
+```
+
+---
+
+## 统一解码脚本 (`decode.py`)
+
+`decode.py` 用于把 JPEG、JPEG 2000、JPEG XL、AVIF、BPG 等压缩码流批量解码为 PNG，适合验证 `--best-only` 或 `--best-bitstreams-dir` 输出的码流能否被统一还原。
+
+```bash
+python decode.py \
+  --input outputs/best_only \
+  --output-dir outputs/decoded_best \
+  --workers 1
+```
+
+如果输入目录里存在 `compressed.avif`，解码结果会输出为：
+
+```text
+outputs/decoded_best/
+  └── compressed.png
+```
+
+本仓库当前环境中已验证：`compressed.avif` 可被 `decode.py` 成功解码为 RGB PNG，分辨率保持 `768x512` 不变。
+
+---
+
+## 测试环境与数据集要求
+
+为保证测试条件一致，建议报告中固定记录以下环境信息：
+
+| 项目 | 当前验证环境 |
+| --- | --- |
+| 操作系统 | Ubuntu 24.04, Linux 6.17.0-23-generic, x86_64 |
+| Python | 3.12.3 |
+| NumPy / Pandas | 2.4.6 / 3.0.3 |
+| Pillow / OpenCV / scikit-image | 12.2.0 / 4.13.0 / 0.26.0 |
+| Matplotlib | 3.10.9 |
+| AVIF 工具 | libavif `avifenc/avifdec` 1.0.4 |
+| JPEG XL 工具 | `cjxl/djxl` 0.7.0 |
+| JPEG 2000 工具 | OpenJPEG `opj_compress/opj_decompress`，通过系统 `PATH` 检测 |
+| BPG 工具 | 可选；未安装时自动跳过 |
+
+### Kodak PhotoCD 基准集
+
+* 路径：`data/kodak`
+* 数量：24 张 RGB 图像
+* 分辨率：每张为 `768x512` 像素或方向互换的同等像素尺寸
+* 现有报告：`reports/kodak_eval/summary.md`
+* 当前报告设置：`target_ratio=16.0`、`min_psnr=35.0 dB`、`mode=quality_first`
+* 当前报告结果：24 张中 20 张同时满足 `CR >= 16` 与 `PSNR >= 35 dB`，通过率 `83.33%`；平均 PSNR `35.6326 dB`，平均 CR `45.7644`。
+
+### 遥感图像 1m 分辨率数据集
+
+项目验收要求：提供 1m 分辨率遥感图像数据集，图像数不少于 1000 张，每张图像分辨率大于 `1500x1500`，并生成该数据集的压缩性能测试报告。
+
+当前仓库内的 `data/remote/mass_roads` 是遥感样例子集：共有 243 张 `.tiff` 图像，尺寸为 `1500x1500`，尚不足以作为“不少于 1000 张”的最终验收数据集。完整验收时请将完整数据集放入例如 `data/remote_sensing_1m`，然后运行：
+
+```bash
+python eval.py \
+  --input-dir data/remote_sensing_1m \
+  --output-dir reports/remote_eval \
+  --mode remote_sensing \
+  --target-ratio 16 \
+  --min-psnr 35 \
+  --codecs jxl,avif,jpeg2000 \
+  --recursive true \
+  --workers 0 \
+  --save-candidates false \
+  --save-all-results-csv false
+```
+
+生成的 `reports/remote_eval/summary.md` 与 `summary.json` 即为遥感图像压缩性能测试报告；如只需要交付 best 压缩码流，可把最后两行改为 `--best-only`，输出目录将只包含每张遥感图的 best 压缩二进制文件。
 
 ---
 

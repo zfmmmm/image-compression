@@ -42,6 +42,8 @@ class AdaptiveSelector:
         mode: str = "ratio_first",
         max_trials_per_codec: int | None = None,
         search_mode: str = "exhaustive",
+        save_candidate_artifacts: bool = True,
+        save_all_results_csv: bool = True,
     ):
         if mode not in VALID_MODES:
             raise ValueError(f"Unknown mode '{mode}'. Valid modes: {sorted(VALID_MODES)}")
@@ -53,6 +55,8 @@ class AdaptiveSelector:
         self.mode = mode
         self.max_trials_per_codec = max_trials_per_codec
         self.search_mode = search_mode
+        self.save_candidate_artifacts = save_candidate_artifacts
+        self.save_all_results_csv = save_all_results_csv
 
     def _params_for_codec(self, codec: BaseCodec) -> list[dict]:
         params = codec.candidate_params()
@@ -74,7 +78,8 @@ class AdaptiveSelector:
             for param in self._params_for_codec(codec):
                 candidate_dir = candidates_dir / f"{codec.name}_{_param_slug(param)}"
                 result = codec.compress_and_eval(input_path, candidate_dir, param)
-                save_result_json(result, candidate_dir / "result.json")
+                if self.save_candidate_artifacts:
+                    save_result_json(result, candidate_dir / "result.json")
                 results.append(result)
         return results
 
@@ -213,8 +218,13 @@ class AdaptiveSelector:
         features = extract_features(image)
         save_features_json(features, output_dir / "features.json")
 
-        results = self.evaluate_all_codecs(input_path, output_dir)
-        save_all_results_csv(results, output_dir / "all_results.csv")
-        best = self.select_best(results, features)
-        best_copy = self._copy_best(best, output_dir)
-        return best_copy, results, features
+        try:
+            results = self.evaluate_all_codecs(input_path, output_dir)
+            if self.save_all_results_csv:
+                save_all_results_csv(results, output_dir / "all_results.csv")
+            best = self.select_best(results, features)
+            best_copy = self._copy_best(best, output_dir)
+            return best_copy, results, features
+        finally:
+            if not self.save_candidate_artifacts:
+                shutil.rmtree(output_dir / "candidates", ignore_errors=True)
