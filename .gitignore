@@ -4,17 +4,17 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-data/
+# data/
 outputs/
 reports/*.csv
 reports/*.json
 reports/*.md
 reports/*.png
-
-*.jxl
-*.avif
-*.jp2
-*.j2k
-*.jpg
-*.jpeg
-*.bpg
+reports/
+# *.jxl
+# *.avif
+# *.jp2
+# *.j2k
+# *.jpg
+# *.jpeg
+# *.bpg

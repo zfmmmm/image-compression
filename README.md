@@ -1,144 +1,329 @@
 # Image Compression Project
 
-面向图像压缩应用的“传统编码器统一接口 + 自适应策略选择”基线项目。当前版本只包含 JPEG、JPEG 2000、JPEG XL、AVIF、BPG 等传统编码器封装，以及基于图像特征和指标约束的策略选择；不包含 CompressAI、PyTorch、神经网络压缩或模型训练。
+面向图像压缩应用的“传统编码器统一接口 + 自适应策略选择”基线项目。本项目旨在为传统图像编码器提供标准化的统一评测体系，通过在压缩前提取图像先验特征，结合特定的业务约束（如体积优先、画质优先、遥感特化），智能遴选出双指标达标的最优压缩参数组合。
 
 ## 支持的编码器
 
 | Codec | 实现方式 | 备注 |
-|---|---|---|
-| JPEG | Pillow | 默认 RGB、4:4:4、`optimize=True` |
-| JPEG 2000 | OpenJPEG `opj_compress` / `opj_decompress` | 自动检测工具是否存在 |
-| JPEG XL | libjxl `cjxl` / `djxl` | 使用 `distance` 参数 |
-| AVIF | libavif `avifenc` / `avifdec` | 默认尝试 `--yuv 444`，失败后回退默认设置 |
-| BPG | `bpgenc` / `bpgdec` | 可选；没有工具时自动跳过 |
+| --- | --- | --- |
+| **JPEG** | Pillow (Python 原生) | 默认强制 RGB、4:4:4 采样、开启 `optimize=True` 霍夫曼表路径优化。 |
+| **JPEG 2000** | OpenJPEG `opj_compress` / `opj_decompress` | 通过系统 `PATH` 自动检测二进制工具是否存在，不可用时自动安全跳过。 |
+| **JPEG XL** | libjxl `cjxl` / `djxl` | 控制维度使用 `distance` 视觉无损距离参数。 |
+| **AVIF** | libavif `avifenc` / `avifdec` | 多层自适应参数降级策略，默认尝试 `--yuv 444`，失败后自动回退。 |
+| **BPG** | `bpgenc` / `bpgdec` | 可选编码器；若系统环境中无该编译工具则自动跳过。 |
 
-## 安装
+---
 
-Python 依赖：
+## 指标定义体系
+
+* **`CR` (Compression Ratio，压缩倍数)**：$\text{原始理论大小} / \text{压缩码流大小}$。
+* **`原始理论大小`**：对于 8-bit RGB 图像，其无损基础字节数严格定义为 $H \times W \times 3 \text{ bytes}$。**绝不使用**输入图片（如 PNG/JPEG/TIFF）在磁盘上的物理占用大小作为分母，确保基准完全一致。
+* **`bpp` (Bits Per Pixel，每像素平均比特数)**：$\text{压缩码流大小 (Bytes)} \times 8 / (H \times W)$。
+* **`PSNR` (峰值信噪比)**：基于 RGB 三通道联合均方误差（MSE）计算，其中亮度最大值取 $\text{MAX}_I = 255$。当重建图与原图完全一致时，MSE 归零，系统安全返回 `inf`。
+* **`SSIM` (结构相似性指标)**：调用底层 `skimage.metrics.structural_similarity` 实现，固定控制参数：`channel_axis=-1`, `data_range=255`。针对分辨率极小的特异图像自带动态降维机制。
+* **`MS-SSIM` (多尺度结构相似性)**：当前作为可选指标保留接口，默认返回 `None`，不阻断、不参与系统评估及格线判定。
+* **`Edge-PSNR` (边缘特化信噪比)**：专为遥感高频线条设计的客观尺子。先用 Canny 算子对原图提取边缘掩膜（Mask），**仅在边缘掩膜覆盖的像素区域内**计算 MSE 并派生 PSNR。当画面无边缘时，安全回退至常规普通 PSNR。
+
+---
+
+## 自适应决策策略
+
+决策大脑负责从几十种穷举实验参数组合中判定最优压缩结果：
+
+1. **`ratio_first` (体积优先导向)**：
+* **准则**：硬性过滤出所有满足压缩倍数 `CR >= target_ratio` 的候选参数池，并从中挑选画质 **PSNR 最高者**。
+* **退路**：若没有任何候选组合能达到目标压缩率，则妥协退步，选择**最接近目标压缩率且画质相对较高**的结果，并在日志中追加 warning 告警。
+
+
+2. **`quality_first` (画质优先导向)**：
+* **准则**：硬性过滤出所有满足及格画质 `PSNR >= min_psnr` 的候选参数池，并从中挑选体积压得最狠（**CR 最高者**）。
+* **退路**：若全盘皆输，没有一个组合能达到最低 PSNR 及格线，则转化为保画质模式，强制录用 **PSNR 最高**的结果，并记录 warning。
+
+
+3. **`remote_sensing` (遥感特化综合打分导向)**：
+* **准则**：首先过滤出满足压缩倍数 `CR >= target_ratio` 的可接受池子，然后利用特征提取器计算出的图像一阶先验特征进行多目标优化权重的动态路由。
+* **权重动态路由表**：
+* 当图像的**边缘密度 (Edge Density) > 0.15**（表明地表建筑物、道路密集、线条高频丰富），系统判定模糊边缘的代价极高，将**完全抛弃体积考量（CR 权重归零），将 Edge-PSNR 的打分权重强行拉高至 30%**。
+* 当边缘密度 $\le 0.15$（如大片农田、海面、荒漠），恢复常规均衡评分权重（CR 占 10%，Edge-PSNR 占 20%）。
+
+
+
+
+
+> **及格判定说明**：元数据中的字段 `passed` 如果为 `True`，代表且仅代表该最优组合在最终结算时，**同时完美越过了两项业务及格线**（即 `CR >= target_ratio` 并且 `PSNR >= min_psnr`）。
+
+---
+
+## 图像读取与清洗约定
+
+为确保实验对比的绝对公平，避免因色彩空间不一致或通道冗余引入偏置，系统自带健壮的数据清洗器 `ensure_rgb_uint8`：
+
+* 支持输入的格式包括 `.png`、`.jpg`、`.jpeg`、`.tif`、`.tiff`、`.bmp`。
+* 所有图像读取后统一转为 RGB 格式的 `uint8` 稠密矩阵。
+* **灰度图**：自动在通道轴维度进行 3 次克隆堆叠，扩展为 RGB 伪彩色矩阵。
+* **RGBA 带透明度的图**：直接丢弃 Alpha 通道，切片保留前 3 个颜色通道。
+* **图片几何特征**：全程严格禁止任何 Resize、裁剪或 Padding 操作，保持原图的分辨率尺寸进入测试管线。
+
+---
+
+## 参数空间方向说明
+
+* **JPEG / AVIF** 的 `quality` 参数：数值越大（范围 1-100），保留的色彩矩阵细节越丰富，重建图画质越高，文件越大。
+* **JPEG XL** 的 `distance` 参数：代表视觉心理学无损容忍距离。**数值越小，代表保留质量越高、文件越大**。
+* **JPEG 2000** 的 `rate` 参数：表示压缩倍数。数值越大，代表目标压缩倍数越高，体积压得越小。
+* **BPG** 的 `quality/q` 参数：表示量化参数。**数值越小，代表量化越细腻、质量越高、文件越大**。该参数的方向与 JPEG 完全相反，请在调整时务必注意。
+
+---
+
+## 运行环境部署指南
+
+### 方法 A：Ubuntu Linux 原生环境部署
+
+#### 1. 编译环境与基础库依赖安装
+
+```bash
+sudo apt update
+sudo apt install -y \
+  git wget curl unzip tree build-essential \
+  python3 python3-venv python3-pip \
+  libjpeg-dev zlib1g-dev libtiff-dev libpng-dev
+
+```
+
+#### 2. 安装外部传统编解码器二进制命令行工具
+
+```bash
+sudo apt install -y libjxl-tools libavif-bin openjpeg-tools
+
+```
+
+*(注：BPG 编码器由于版权等原因不在 Ubuntu 的默认官方 apt 源中，属于可选支持，不安装时系统在启动健康检查后会自动将其跳过，不阻断程序运行)*。
+
+#### 3. Python 虚拟环境与依赖包装配
+
+为了全面对齐本项目锁定的最新版本依赖包（如 `tifffile==2026.5.15` 要求 Python $\ge 3.12$），**强烈建议您的 Ubuntu 宿主机环境保持在 Python 3.12 及以上版本**。
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
+
 ```
 
-Ubuntu 外部工具示例：
+## 单图自适应压缩入口 (`compress.py`)
+
+当你需要处理单张高价值的单体特异图像，让系统自动搜寻匹配最佳压缩方案时运行此文件。
+
+### 启动命令模板
 
 ```bash
-sudo apt-get update
-sudo apt-get install libjxl-tools libavif-bin openjpeg-tools
+python compress.py --input <输入路径> --output-dir <输出目录> [其他可选参数...]
+
 ```
-
-BPG 通常不在默认源中，属于可选编码器。程序会通过 `shutil.which()` 检测 `cjxl`、`djxl`、`avifenc`、`avifdec`、`opj_compress`、`opj_decompress`、`bpgenc`、`bpgdec`，不可用时记录 warning 并跳过该编码器。
-
-## 单图压缩
-
+如：
 ```bash
 python compress.py \
   --input data/kodak/kodim01.png \
   --output-dir outputs/kodim01 \
-  --mode ratio_first \
+  --mode quality_first \
   --target-ratio 16 \
   --min-psnr 35 \
-  --codecs jxl,avif,jpeg2000 \
-  --search exhaustive
+  --codecs jpeg,jxl,avif,jpeg2000
 ```
+### 参数详解大表
 
-输出结构示例：
+| 命令行参数 | 参数类型 | 是否必填 | 核心含义与作用 | 填法指导与推荐值 | 所有合法候选项 |
+| --- | --- | --- | --- | --- | --- |
+| **`--input`** | `Path` | **是** | 待压缩的原始图像文件路径。 | 填入本地图片的相对或绝对路径。 | 任意支持的图像格式：`.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.bmp`。 |
+| **`--output-dir`** | `Path` | **是** | 压缩结果与穷举实验数据的输出根目录。 | 填入一个文件夹路径，系统会自动创建它。 | 任意合法的本地文件夹路径（如 `outputs/my_test`）。 |
+| **`--mode`** | `str` | 否 | 决策大脑的自适应优选策略模式。 | 默认值 `ratio_first`。若你的业务硬性指标死守画质，强烈推荐改填 `quality_first`。 | `ratio_first` (体积优先达标下求画质最高)<br>`quality_first` (画质及格下求体积最小)<br>`remote_sensing` (遥感边缘特化加权打分机制) |
+| **`--target-ratio`** | `float` | 否 | 验收指标 1：业务所要求的最低目标压缩倍数。 | 默认值 `16.0`。代表压缩后占用的空间必须小于等于像素未压缩理论体积的 1/16。 | 大于 0 的任意正浮点数（业界常用：`8.0`, `16.0`, `32.0`）。 |
+| **`--min-psnr`** | `float` | 否 | 验收指标 2：业务所要求的最低峰值信噪比（画质及格线）。 | 默认值 `35.0`。低于此 dB 值，系统结算时会在日志中吐出未通过警告。 | 任意浮点数（建议配置范围：`30.0` 至 `45.0`）。 |
+| **`--codecs`** | `str` | 否 | 允许加入本次压缩竞技场的传统编码器集群。 | 默认值 `"jpeg,jxl,avif,jpeg2000"`。使用标准英文逗号分隔，相互之间绝对不能包含空格。 | 可从以下关键词中选择并任意克隆缩减组合：<br>`jpeg`, `jxl` (或 `jpegxl`), `avif`, `jpeg2000` (或 `jp2`), `bpg` |
+| **`--search`** | `str` | 否 | 参数空间的搜索优化算法。 | 默认值 `exhaustive`。当前代码中 `coarse_to_fine` 为预留扩展接口，底层运行逻辑仍会映射至穷举。 | `exhaustive`（全量穷举搜索） / `coarse_to_fine`（保留接口） |
+| **`--max-trials-per-codec`** | `int` | 否 | 限制单个编码器在穷举时最多只允许评测参数池中的前 N 种可能。 | 默认不填（`None`），代表全参数空间大扫荡。如果在大分辨率遥感测试下耗时严重，可以填入 `3` 或 `5` 截断测试。 | 任意正整数，或者不填。 |
+| **`--timeout`** | `float` | 否 | 发起外部命令行进程调用时的超时强制熔断阈值（秒）。 | 默认值 `600.0`（10分钟）。若要批量压制分辨率极其庞大（例如单图数千万像素）的遥感超大原始图切片，建议将此值放大。 | 任意正浮点数。 |
+| **`--log-level`** | `str` | 否 | 控制台打印出的实时日志信息颗粒度分级。 | 默认值 `INFO`。若遇到外部工具死锁崩溃，可以填入 `DEBUG` 查看具体底层的进程报错详情。 | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`。 |
 
-```text
-outputs/kodim01/
-  candidates/
-    jxl_distance_1p5_effort_7/
-      compressed.jxl
-      recon.png
-      result.json
-  best/
-    compressed.jxl
-    recon.png
-    best_result.json
-  all_results.csv
-  features.json
+---
+
+## 数据集批量跑分评估入口 (`eval.py`)
+
+当你手头拥有完整的数据集文件夹（如学术界通用的 24 张 Kodak 基准测试集，或是包含上千张高分辨率的遥感图像集），需要执行大规模自动化跑分时调用此文件。它会自动交叉穷举所有的可能，最终导出包含率失真散点图（RD-Scatter）及完整分析结论的学术大报告。
+
+### 启动命令模板
+
+```bash
+python eval.py --input-dir <数据文件夹> --output-dir <报告输出总目录> [其他可选参数...]
+
 ```
-
-## Kodak 批量测试
-
+如：
 ```bash
 python eval.py \
   --input-dir data/kodak \
   --output-dir reports/kodak_eval \
-  --mode ratio_first \
-  --target-ratio 16 \
-  --min-psnr 35 \
-  --codecs jpeg,jxl,avif,jpeg2000 \
-  --recursive false
-```
+  --mode quality_first \
+  --target-ratio 16.0 \
+  --min-psnr 35.0 \
+  --codecs jxl,avif,jpeg2000 \
+  --workers 0
 
-## 遥感图像批量测试
-
-```bash
+  #或者使用remote_sensing
 python eval.py \
-  --input-dir data/remote \
+  --input-dir data/remote_sensing_1m \
   --output-dir reports/remote_eval \
   --mode remote_sensing \
-  --target-ratio 16 \
-  --min-psnr 35 \
+  --target-ratio 16.0 \
+  --min-psnr 35.0 \
   --codecs jxl,avif,jpeg2000 \
-  --recursive true
-```
+  --workers 0
+``` 
+`eval.py` 完全承袭了 `compress.py` 的全套算法深度控制参数（如 `--mode`, `--target-ratio`, `--min-psnr` 等），其核心作用完全对齐。以下仅单独为你展现其**特有或发生形态改变**的三个特殊参数：
 
-批量评估会生成：
+| 命令行参数 | 参数类型 | 是否必填 | 核心含义与作用 | 填法指导与推荐值 | 所有合法候选项 |
+| --- | --- | --- | --- | --- | --- |
+| **`--input-dir`** | `Path` | **是** | 存放测试大样本图像的数据集根目录。 | 填入本地存放图像数据文件夹的物理路径。 | 任意合法的本地已存在文件夹路径（如 `data/kodak`）。 |
+| **`--output-dir`** | `Path` | **是** | 批量跑分结束后，全局学术报告和图表沉淀的落脚目录。 | 填入目标总结果文件夹路径，系统会自动在其下方派生 `summary.md` 等多维度汇总成果。 | 任意合法的本地空目录路径（如 `reports/remote_eval`）。 |
+| **`--recursive`** | `bool` | 否 | 是否对输入根目录执行深度穿透扫描，挖掘其**子文件夹内部**嵌套的全部图片。 | 默认值 `false`。若图片都在第一层（如 Kodak），填 `false`；如果是包含层级子目录的大规模遥感图片集，**必须填入 `true`**。 | 字符串或布尔对象：<br>• 判定为真的填法：`true`, `1`, `yes`, `y`<br>• 判定为假的填法：`false`, `0`, `no`, `n`。 |
+
+---
+
+## 各编码器内部穷举的隐藏参数池
+
+为了让整个自适应优选流程具备完备的科学基准依据，各底层包装子包内部内置了硬编码的参数竞技场候选池，运行期间系统会在背景对各格式的以下参数组合进行全量遍历测试：
+
+1. **JPEG (`jpeg`)**
+* **控制轴心**：`quality`（图像量化质量参数，越大图像文件越大、画质越趋向无损）。
+* **硬编码穷举参数池**：`[95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10]`。
+
+
+2. **JPEG XL (`jxl`)**
+* **控制轴心**：`distance`（视觉无损门槛容忍度，越接近 0 意味着压缩保真度越惊人、体积降幅越缓和）。
+* **硬编码穷举参数池**：`[0.5, 0.8, 1.0, 1.2, 1.5, 1.8, 2.0, 2.5, 3.0, 3.5, 4.0]`。
+
+
+3. **AVIF (`avif`)**
+* **控制轴心**：`quality`（色彩压缩质量比例因子）。
+* **硬编码穷举参数池**：`[95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20]`。
+
+
+4. **JPEG 2000 (`jpeg2000`)**
+* **控制轴心**：`rate`（压缩倍率，代表期望目标文件将体积削减至原始理论值的大几分之一）。
+* **硬编码穷举参数池**：`[8, 10, 12, 14, 16, 18, 20, 24, 28, 32]`。
+
+
+5. **BPG (`bpg`)**
+* **控制轴心**：`quality`（量化阶级因子，值越小量化越完美、画质保真度越强，其参数增减方向与常规标准 JPEG 颠倒）。
+* **硬编码穷举参数池**：`[20, 24, 28, 32, 36, 40, 44, 48]`。
+
+
+
+---
+
+## 输出文件树产物及作用
+
+无论是进行单图压缩还是批量跑分，输出的最终结果文件夹中均会包含以下结构，各文件的核心工程作用如下：
 
 ```text
-per_image_results.csv
-all_candidate_results.csv
-summary.json
-summary.md
-rd_scatter.png
-psnr_hist.png
-cr_hist.png
+outputs/kodim01/
+  ├── best/
+  │    ├── compressed.avif     # 真正由选出的最优格式和参数生成的二进制有损压缩文件（主交付物）。
+  │    ├── recon.png           # 获胜码流经过反向解码还原出的标准 PNG 稠密像素图，用于直接人工判读画质。
+  │    └── best_result.json    # 存储当前这组最优解的客观性能统计与策略通关详细档案。
+  ├── candidates/              # 穷举实验过程的临时聚集地，内部按照不同的编码器参数命名建立了子文件夹。
+  │    └── jxl_distance_1p5_effort_7/
+  │         ├── compressed.jxl # 某一组合试错时产生的中间临时压缩码流。
+  │         ├── recon.png      # 该中间组合反解码的临时重建图。
+  │         └── result.json    # 该特定组合的客观跑分数据小卡片。
+  ├── all_results.csv          # 极其关键的学术底表。将上述所有试错项数据合并汇总成的二维大表格，可供直接拉入 Excel。
+  └── features.json            # 图像进入管线前提取的全局一阶感知特征（信息熵、色彩丰富度、边缘密度等）。
+
 ```
 
-## 指标定义
+---
 
-- `CR`：压缩倍数，`原始理论大小 / 压缩码流大小`。
-- `原始理论大小`：对 8-bit RGB 图像使用 `H * W * 3` bytes，不使用 PNG/JPEG/TIFF 文件在磁盘上的大小。
-- `bpp`：`压缩码流大小 * 8 / (H * W)`。
-- `PSNR`：RGB 三通道整体 MSE，`MAX_I = 255`；完全一致时返回 `inf`。
-- `SSIM`：`skimage.metrics.structural_similarity`，`channel_axis=-1`，`data_range=255`。
-- `MS-SSIM`：当前作为可选指标保留接口，默认返回 `None`，不会导致评估失败。
-- `Edge-PSNR`：用 Canny 边缘 mask 只在边缘区域计算 PSNR；没有边缘时回退普通 PSNR。
+## 单图通关元数据 JSON 字段详解
 
-## 自适应策略
+以下为系统输出的单图最优解报告档案（`best_result.json`）的真实元数据内容，对其中包含的每一行核心技术指标进行点对点拆解注释：
 
-- `ratio_first`：先要求 `CR >= target_ratio`，在满足压缩率的候选中选择 PSNR 最高者。若无候选达到目标压缩率，选择最接近目标压缩率且 PSNR 更高的结果，并记录 warning。
-- `quality_first`：先要求 `PSNR >= min_psnr`，在满足质量的候选中选择 CR 最高者。若无候选达到最低 PSNR，选择 PSNR 最高的结果，并记录 warning。
-- `remote_sensing`：先要求 `CR >= target_ratio`，再按 PSNR、SSIM、Edge-PSNR、CR 的加权分数选择。边缘密度较高时提高 Edge-PSNR 权重，降低 CR 权重。
+```json
+{
+  "codec_name": "avif",
+  // 判定当前单图竞技场中综合胜出的有损图像编码器为 AVIF 格式。
 
-`passed` 表示最终结果同时满足验收目标：`CR >= target_ratio` 且 `PSNR >= min_psnr`。
+  "input_path": "data/kodak/kodim01.png",
+  // 本次进行性能评测测验的原始输入图像文件源头路径。
 
-## 图像读取约定
+  "bitstream_path": "outputs/kodim01/best/compressed.avif",
+  // 最终获胜的最佳压缩码流二进制文件在系统盘中的实际落地物理路径。
 
-支持 `.png`、`.jpg`、`.jpeg`、`.tif`、`.tiff`、`.bmp`。所有输入读取后统一转为 RGB `uint8`：
+  "recon_path": "outputs/kodim01/best/recon.png",
+  // 最佳码流经反向解码还原出的标准无损 PNG 重建图像物理路径。
 
-- 灰度图会扩展为 RGB。
-- RGBA 会丢弃 alpha 并转为 RGB。
-- Kodak 图像不 resize、不裁剪，保持原图尺寸。
+  "param": {
+    "quality": 55,
+    "speed": 4,
+    "yuv444": true
+  },
+  // 详细复盘底层的外部工具链调用时使用的核心量化控制参数：
+  // 质量因子设定为 55，CPU 耗时等级为 4，开启 yuv444 色彩全采样，绝不在色度维度丢失地物色彩。
 
-## 参数方向说明
+  "original_theoretical_size": 1179648,
+  // 原始输入图像以无损纯像素矩阵计算出来的绝对理论字节大小（单位：Bytes）。
+  // 该图分辨率为 768*512，计算依据为 768 * 512 * 3字节 = 1,179,648 字节。
 
-- JPEG / AVIF 的 `quality` 越大质量越高、文件越大。
-- JPEG XL 的 `distance` 越小质量越高、文件越大。
-- JPEG 2000 的 `rate` 表示目标压缩倍数。
-- BPG 的 `quality`/`q` 越小质量越高、文件越大，这一点和 JPEG 相反。
+  "compressed_size": 74293,
+  // 二进制压缩码流文件在硬盘上实际占用的物理物理空间大小（单位：Bytes）。
+  // 表明原本 1.17 MB 的图片被剧烈压榨精简到了 74.2 KB。
 
-## 测试
+  "compression_ratio": 15.87831962634434,
+  // 压缩倍数 (CR)，计算公式为 original_theoretical_size / compressed_size。
+  // 指明当前这组参数将图片的物理体积成功缩减了 15.87 倍。
 
-```bash
-source .venv/bin/activate
-pytest tests -q
+  "bpp": 1.5114949544270833,
+  // bpp 指标，学术界衡量图像压缩率的核心尺子。计算公式：(Compressed_Size * 8) / (768 * 512)。
+  // 表明画面中平均每个像素点仅耗费 1.51 个比特空间进行描述（在未压缩前 RGB 固有的原始 bpp 为 24）。
+
+  "psnr": 35.686021832367885,
+  // PSNR（峰值信噪比），客观画质指标，单位 dB。数值越高画质越细腻。
+  // 35.68 dB 说明该图在整体保真度维度上已经成功超越了项目所订立的 35dB 及格线。
+
+  "ssim": 0.9619519596209244,
+  // SSIM（结构相似性），取值范围 [0, 1]。越趋近 1 表明物体的结构、亮度对比度与原图越接近。
+  // 0.9619 说明在人类肉眼主观判读层面，该重建图具备极强的逼真度和极低的几何失真。
+
+  "ms_ssim": null,
+  // 多尺度结构相似性。作为可选指标，在该传统编码器框架中默认关闭并返回 null，不参与指标卡点阻断。
+
+  "edge_psnr": 34.84573400921936,
+  // 边缘区域峰值信噪比，单位 dB。系统通过 Canny 提取画面线条轮廓，单独计算高频边缘处的保真度。
+  // 34.84 dB 标明线条轮廓处发生了一定程度的有损边缘钝化模糊。
+
+  "encode_time_ms": 1777.5703980000799,
+  // 编码端耗时（单位：毫秒）。表明调用底层的 avifenc 命令行程序执行图像有损压缩消耗了约 1.77 秒。
+
+  "decode_time_ms": 104.83712399991418,
+  // 解码解压耗时（单位：毫秒）。表明将 74KB 的码流反解码重新还原为能用来屏幕显示的图片仅消耗了 0.1 秒。
+  // 具有“编码慢、解码快”的非对称高效特性。
+
+  "success": true,
+  // 整个编解码运行管线和矩阵指标计算的健康状态断言。
+  // 如果为 true，说明管线一马平川，没有发生任何外部系统工具死锁或报错崩溃。
+
+  "error_message": null,
+  // 底层报错捕获日志。由于 success 为真，此处没有捕获到任何 Runtime 报错，返回 null。
+
+  "passed": false,
+  // 最终业务指标综合验收合格通过断言。
+  // 极其核心：此处显示为 false，说明当前的这组最优参数并没能顺利通过该项目的最终硬性验收条件！
+
+  "warning_message": "Selected result did not reach target CR >= 16"
+  // 业务判定不合规告警详细原因：
+  // 仔细推导：用户设置的目标压缩倍数下限要求硬性死守 16 倍，而上面该参数组合计算出的具体 CR 值为 15.8783，
+  // 距离目标及格线发生了微弱的 0.12 差距，导致整体判定直接被策略大脑驳回，吐出 passed=false 警告！
+}
+
 ```
 
-## 注意事项
-
-项目目录按需求包含 `codecs/`，它与 Python 标准库 `codecs` 同名。运行入口和测试会先启用本地子模块路径，以便 `codecs/base.py` 等文件可正常导入，同时保留标准库 `codecs` 的原有功能。
+---
